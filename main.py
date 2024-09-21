@@ -9,6 +9,7 @@ class TransactionType(Enum):
     DEDUCTION = auto()
     DEPOSIT = auto()
     CHECK = auto()
+    
 
 class ParserState(Enum):
     START = auto()
@@ -34,13 +35,8 @@ class BankTransaction:
         self.amount = amount
         self.description = description
     
-    def __add__(self, target):
-        if isinstance(target, (BankTransaction, float)):
-            return self.amount + (target.amount if isinstance(target, BankTransaction) else target)
-        raise ValueError("Target must be a Transaction or float type")
-    
     def __repr__(self):
-        return f"Transaction(date='{self.date}', amount={self.amount}, description='{self.description}')"
+        return f"Transaction(date='{self.date}', type={self.type}, amount={self.amount}, description='{self.description}')"
 
 class BankStatement:
     def __init__(self, entries: List[BankTransaction], date: str):
@@ -61,7 +57,7 @@ def parse_transaction_text(data: list):
     state = ParserState.START
     
     for line in data:
-        print('LINE: ' + line)
+        # print('LINE: ' + line)
         if re.search('Daily Balance Detail', line):
             state = ParserState.DONE
             break
@@ -74,7 +70,6 @@ def parse_transaction_text(data: list):
             case ParserState.FIND_TOTALS:
                 tokenized = [float(l.replace(',', '')) for l in line.split()]
                 if not total_deductions and len(tokenized) == 4:
-                    # 0 = Beginning bal, 1 = Total deposits, 2 = Total deductions, 3 = Ending bal
                     total_deposits = tokenized[1]
                     total_deductions = tokenized[2]
                     state = ParserState.FIND_DEPOSITS
@@ -135,16 +130,16 @@ def parse_transaction_text(data: list):
                     state = ParserState.READ_ONLINE_DEDUCTIONS      
     
     # Parsing and validation
-    sum_of_deductions = sum([float(t.amount) for t in transactions if t.type in (TransactionType.CHECK, TransactionType.DEDUCTION)])
-    sum_of_deposits = sum([float(t.amount) for t in transactions if t.type == TransactionType.DEPOSIT])
+    sum_of_deductions = round(sum([float(t.amount) for t in transactions if t.type in (TransactionType.CHECK, TransactionType.DEDUCTION)]), 2)
+    sum_of_deposits = round(sum([float(t.amount) for t in transactions if t.type == TransactionType.DEPOSIT]), 2)
     if sum_of_deductions != total_deductions:
-        print(f'\033[93mERROR; EXPECTED {total_deductions}, GOT: {sum_of_deductions}\033[0m')
+        print(f'\033[93mDEDUCTION ERROR; EXPECTED {total_deductions}, GOT: {sum_of_deductions}\033[0m')
     else:
-        print(f'\033[92mTOTALS MATCH!\033[0m {total_deductions} == {sum_of_deductions}')
+        print(f'\033[92mDEDUCTIONS MATCH!\033[0m {total_deductions} == {sum_of_deductions}')
     if sum_of_deposits != total_deposits:
-        print(f'\033[93mERROR; EXPECTED {total_deposits}, GOT: {sum_of_deposits}\033[0m')
+        print(f'\033[93mDEPOSIT ERROR; EXPECTED {total_deposits}, GOT: {sum_of_deposits}\033[0m')
     else:
-        print(f'\033[92mTOTALS MATCH!\033[0m {total_deposits} == {sum_of_deposits}')
+        print(f'\033[92mDEPOSITS MATCH!\033[0m {total_deposits} == {sum_of_deposits}')
     return transactions
 
 def record(ledger: List[BankTransaction], type: TransactionType, entry: str):
@@ -157,7 +152,7 @@ def record(ledger: List[BankTransaction], type: TransactionType, entry: str):
                 return
             for i in range(0, len(split), 4):
                 check_num = split[i]
-                amount = split[i+1]
+                amount = round(float(split[i+1].replace(',', '')), 2)
                 date = split[i+2]
                 reference = split[i+3]
                 ledger.append(BankTransaction(date, type, amount, f'Check number: {check_num} [ref:{reference}]'))
@@ -165,12 +160,12 @@ def record(ledger: List[BankTransaction], type: TransactionType, entry: str):
         case TransactionType.DEDUCTION | TransactionType.DEPOSIT:
             # '05/23 46.07 Debit Card Credit Wm Supercenter #1885
             # BUTLER PA'
-            pattern = re.compile(r'^\d{2}/\d{2} \d')
+            pattern = re.compile(r'^\d{2}/\d{2} ')
             if pattern.match(entry):
                 tokens = entry.split(maxsplit=2)
                 if len(tokens) >= 3:
                     date = tokens[0]
-                    amount = tokens[1]
+                    amount = round(float(tokens[1].replace(',', '')), 2)
                     description = tokens[2]
                     ledger.append(BankTransaction(date, type, amount, description))
             elif len(ledger) > 1:
