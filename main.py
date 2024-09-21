@@ -147,7 +147,6 @@ def record(ledger: List[BankTransaction], type: TransactionType, entry: str):
         return    
     match (type):
         case TransactionType.CHECK:
-            # '240 300.00 05/24 012345678 241 480.00 05/31 123456789'
             if len(split := entry.split()) < 4:
                 return
             for i in range(0, len(split), 4):
@@ -158,8 +157,6 @@ def record(ledger: List[BankTransaction], type: TransactionType, entry: str):
                 ledger.append(BankTransaction(date, type, amount, f'Check number: {check_num} [ref:{reference}]'))
         
         case TransactionType.DEDUCTION | TransactionType.DEPOSIT:
-            # '05/23 46.07 Debit Card Credit Wm Supercenter #1885
-            # BUTLER PA'
             pattern = re.compile(r'^\d{2}/\d{2} ')
             if pattern.match(entry):
                 tokens = entry.split(maxsplit=2)
