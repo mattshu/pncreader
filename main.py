@@ -42,16 +42,21 @@ def parse_transaction_text(data: list):
     
     check_pattern = re.compile(r'\d+ \d+\.\d{2} \d{2}/\d{2}')
     trans_pattern = re.compile(r'^\d{2}/\d{2} (\d{1,3}(,\d{3})*|\d*)\.\d{2} ')
-    totals_pattern = re.compile(r'^\d{1,3}(?:,\d{3})*\.\d{2}(?: \d{1,3}(?:,\d{3})*\.\d{2}){3}$')
+    totals_pattern = re.compile(r'^(\d{1,3}(?:,\d{3})*\.\d{2}-?)(?: (\d{1,3}(?:,\d{3})*\.\d{2}-?)){3}$')
     
     tail, head = itertools.tee(data)
     next(head)
     
     for line, next_line in zip(tail, head):
         if not total_deductions and totals_pattern.match(line):
-            tokens = [float(l.replace(',', '')) for l in line.split()]
-            total_deposits = tokens[1]
-            total_deductions = tokens[2]
+            totals = []
+            for l in line.split():
+                total = l.replace(',','')
+                if l.endswith('-'):
+                    total = '-' + l[:-1]
+                totals.append(float(total))
+            total_deposits = totals[1]
+            total_deductions = totals[2]
         elif re.search('Deposits and Other Additions There were', line):
             trans_type = TransactionType.DEPOSIT
         elif re.search('Checks and Substitute Checks', line):
@@ -134,7 +139,9 @@ def _dbg_convert_pdfs_to_text_files():
 # DEBUG
 jun = load_text_file_to_list('jun.txt')
 jul = load_text_file_to_list('jul.txt')
+aug = load_text_file_to_list('aug.txt')
 pjun = parse_transaction_text(jun)
 pjul = parse_transaction_text(jul)
+paug = parse_transaction_text(aug)
 from pprint import pprint
 pp =  lambda v: pprint(v)
