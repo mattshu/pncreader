@@ -1,3 +1,4 @@
+import itertools
 import os
 import re
 from enum import Enum, auto
@@ -14,18 +15,12 @@ class TransactionType(Enum):
 class ParserState(Enum):
     START = auto()
     FIND_TOTALS = auto()
-    FIND_DEPOSITS = auto()
     READ_DEPOSITS = auto()
-    FIND_CHECK_TRANSACTIONS = auto()
     READ_CHECK_TRANSACTIONS = auto()
-    FIND_DEBIT_TRANSACTIONS = auto()
     READ_DEBIT_TRANSACTIONS = auto()
     READ_BANKING_DEDUCTIONS = auto()
     READ_ONLINE_DEDUCTIONS = auto()
     READ_OTHER_DEDUCTIONS = auto()
-    PAGE_BREAK_DEBIT = auto()
-    PAGE_BREAK_DEPOSITS = auto()
-    PAGE_BREAK_ONLINE = auto()
     DONE = auto()
 
 class BankTransaction:
@@ -54,10 +49,24 @@ def parse_transaction_text(data: list):
     transactions: List[BankTransaction] = []
     total_deductions = 0.0
     total_deposits = 0.0
-    state = ParserState.START
     
-    for line in data:
-        # print('LINE: ' + line)
+    f_page_break = False
+    
+    state = ParserState.START
+
+    tail, head = itertools.tee(data)
+    next(head)
+    
+    trans_type: TransactionType = TransactionType.DEDUCTION
+    
+    for line, next_line in zip(tail, head):
+        if f_page_break and line == 'Date Amount Description':
+            f_page_break = False
+            continue
+        elif re.search('continued on next page', line):
+            f_page_break = True
+            continue
+        
         if re.search('Daily Balance Detail', line):
             state = ParserState.DONE
             break
@@ -66,73 +75,62 @@ def parse_transaction_text(data: list):
             case ParserState.START:
                 if line == 'balance':
                     state = ParserState.FIND_TOTALS
-            
             case ParserState.FIND_TOTALS:
-                tokenized = [float(l.replace(',', '')) for l in line.split()]
-                if not total_deductions and len(tokenized) == 4:
+                if not total_deductions:
+                    tokenized = [float(l.replace(',', '')) for l in line.split()]
                     total_deposits = tokenized[1]
                     total_deductions = tokenized[2]
-                    state = ParserState.FIND_DEPOSITS
-            
-            case ParserState.FIND_DEPOSITS:
-                if re.search('Deposits and Other Additions There were', line):
+                elif re.search('Deposits and Other Additions There were', line):
                     state = ParserState.READ_DEPOSITS
-            
             case ParserState.READ_DEPOSITS:
-                if re.search('continued on next page', line):
-                    state = ParserState.PAGE_BREAK_DEPOSITS
-                elif re.search('Checks and Substitute Checks', line):
+                if re.search('Checks and Substitute Checks', line):
                     state = ParserState.READ_CHECK_TRANSACTIONS
-                else:
-                    record(transactions, TransactionType.DEPOSIT, line)
-            
-            # TODO what happens when we have more than one or two checks?
+                    continue
+                trans_type = TransactionType.DEPOSIT
             case ParserState.READ_CHECK_TRANSACTIONS:
                 if re.search('Gap in check sequence', line):
-                    state = ParserState.FIND_DEBIT_TRANSACTIONS
-                check_pattern = r'\d+ \d+\.\d{2} \d{2}/\d{2}'
-                if re.search(check_pattern, line):
-                    record(transactions, TransactionType.CHECK, line)
-            
-            case ParserState.FIND_DEBIT_TRANSACTIONS:
-                if re.search('Banking/Debit Card Withdrawals and Purchases There were', line):
                     state = ParserState.READ_DEBIT_TRANSACTIONS
-            
+                    continue
+                check_pattern = re.compile(r'\d+ \d+\.\d{2} \d{2}/\d{2}')
+                if check_pattern.match(line):
+                    trans_type = TransactionType.CHECK
             case ParserState.READ_DEBIT_TRANSACTIONS:
-                if re.search('continued on next page', line):
-                    state = ParserState.PAGE_BREAK_DEBIT
-                elif re.search('Banking Deductions totaling', line):
+                if re.search('Banking Deductions totaling', line):
                     state = ParserState.READ_ONLINE_DEDUCTIONS
                 else:
-                    record(transactions, TransactionType.DEDUCTION, line)
-            
-            case ParserState.READ_ONLINE_DEDUCTIONS:
+                    trans_type = TransactionType.DEDUCTION
+            case ParserState.READ_ONLINE_DEDUCTIONS | ParserState.READ_OTHER_DEDUCTIONS:
                 if re.search('Other Deductions There were', line):
                     state = ParserState.READ_OTHER_DEDUCTIONS
-                elif re.search('continued on next page', line):
-                    state = ParserState.PAGE_BREAK_ONLINE
                 else:
-                    record(transactions, TransactionType.DEDUCTION, line)
-            
-            case ParserState.READ_OTHER_DEDUCTIONS:
-                    record(transactions, TransactionType.DEDUCTION, line)
-            
-            case ParserState.PAGE_BREAK_DEPOSITS:
-                if re.search('Date Amount Description', line):
-                    state = ParserState.READ_DEPOSITS
-            
-            case ParserState.PAGE_BREAK_DEBIT:
-                if re.search('Date Amount Description', line):
-                    state = ParserState.READ_DEBIT_TRANSACTIONS
-            
-            case ParserState.PAGE_BREAK_ONLINE:
-                if re.search('Date Amount Description', line):
-                    state = ParserState.READ_ONLINE_DEDUCTIONS      
+                    trans_type = TransactionType.DEDUCTION
+        
+        # Processing the transaction
+        if trans_type == TransactionType.CHECK:
+            split = line.split()
+            if len(split) >= 4:
+                for i in range(0, len(split), 4):
+                    check_num = split[i]
+                    amount = round(float(split[i+1].replace(',', '')), 2)
+                    date = split[i+2]
+                    reference = split[i+3]
+                    transactions.append(BankTransaction(date, trans_type, amount, f'Check number: {check_num} [ref:{reference}]'))
+        elif trans_type in (TransactionType.DEDUCTION, TransactionType.DEPOSIT):
+            pattern = re.compile(r'^\d{2}/\d{2} (\d{1,3}(,\d{3})*|\d*)\.\d{2} ')
+            if pattern.match(line):
+                tokens = line.split()
+                if len(tokens) >= 3:
+                    date = tokens[0]
+                    amount = round(float(tokens[1].replace(',', '')), 2)
+                    description = ' '.join(tokens[2:])
+                    if not pattern.match(next_line):
+                        description += ' ' + next_line
+                    transactions.append(BankTransaction(date, trans_type, amount, description))
     
     # Parsing and validation
     sum_of_deductions = round(sum([float(t.amount) for t in transactions if t.type in (TransactionType.CHECK, TransactionType.DEDUCTION)]), 2)
     sum_of_deposits = round(sum([float(t.amount) for t in transactions if t.type == TransactionType.DEPOSIT]), 2)
-    if sum_of_deductions != total_deductions:
+    if sum_of_deductions != total_deductions:   
         print(f'\033[93mDEDUCTION ERROR; EXPECTED {total_deductions}, GOT: {sum_of_deductions}\033[0m')
     else:
         print(f'\033[92mDEDUCTIONS MATCH!\033[0m {total_deductions} == {sum_of_deductions}')
@@ -141,36 +139,6 @@ def parse_transaction_text(data: list):
     else:
         print(f'\033[92mDEPOSITS MATCH!\033[0m {total_deposits} == {sum_of_deposits}')
     return transactions
-
-def record(ledger: List[BankTransaction], type: TransactionType, entry: str):
-    if not entry or len(entry) <= 0:
-        return    
-    match (type):
-        case TransactionType.CHECK:
-            if len(split := entry.split()) < 4:
-                return
-            for i in range(0, len(split), 4):
-                check_num = split[i]
-                amount = round(float(split[i+1].replace(',', '')), 2)
-                date = split[i+2]
-                reference = split[i+3]
-                ledger.append(BankTransaction(date, type, amount, f'Check number: {check_num} [ref:{reference}]'))
-        
-        case TransactionType.DEDUCTION | TransactionType.DEPOSIT:
-            pattern = re.compile(r'^\d{2}/\d{2} ')
-            if pattern.match(entry):
-                tokens = entry.split(maxsplit=2)
-                if len(tokens) >= 3:
-                    date = tokens[0]
-                    amount = round(float(tokens[1].replace(',', '')), 2)
-                    description = tokens[2]
-                    ledger.append(BankTransaction(date, type, amount, description))
-            elif len(ledger) > 1:
-                ledger[-1].description += ' ' + entry
-
-##############################################################################
-##############################################################################
-##############################################################################
 
 def load_text_file_to_list(file_name):
     try:
@@ -215,3 +183,5 @@ jun = load_text_file_to_list('jun.txt')
 jul = load_text_file_to_list('jul.txt')
 pjun = parse_transaction_text(jun)
 pjul = parse_transaction_text(jul)
+from pprint import pprint
+pp =  lambda v: pprint(v)
