@@ -2,7 +2,7 @@ import itertools
 import os
 import re
 from enum import Enum, auto
-from PyPDF2 import PdfReader
+from pypdf import PdfReader
 from typing import List
 
 
@@ -10,9 +10,8 @@ class TransactionType(Enum):
     DEDUCTION = auto()
     DEPOSIT = auto()
     CHECK = auto()
-    
 
-class BankTransaction:
+class Transaction:
     def __init__(self, date: str, type: TransactionType, amount: float, description: str):
         self.date = date
         self.type = type
@@ -21,21 +20,32 @@ class BankTransaction:
     
     def __repr__(self):
         return f"Transaction(date='{self.date}', type={self.type}, amount={self.amount}, description='{self.description}')"
+    
+    def __eq__(self, other):
+        if isinstance(other, Transaction):
+            return (self.date == other.date and 
+                    self.type == other.type and 
+                    self.amount == other.amount and 
+                    self.description == other.description)
+        return False
+    
+    def __hash__(self):
+        return hash((self.date, self.type, self.amount, self.description))
 
 class BankStatement:
-    def __init__(self, entries: List[BankTransaction], date: str):
+    def __init__(self, entries: List[Transaction], date: str):
         self.entries = entries
         self.date = date
         
     def append(self, target):
-        if isinstance(target, BankTransaction):
+        if isinstance(target, Transaction):
             self.entries.append(target)
 
 def parse_transaction_text(data: list):
     if not data:
         return []
     
-    transactions: List[BankTransaction] = []
+    transactions: List[Transaction] = []
     trans_type: TransactionType = None
     total_deductions = 0.0
     total_deposits = 0.0
@@ -43,10 +53,10 @@ def parse_transaction_text(data: list):
     check_pattern = re.compile(r'\d+ \d+\.\d{2} \d{2}/\d{2}')
     trans_pattern = re.compile(r'^\d{2}/\d{2} (\d{1,3}(,\d{3})*|\d*)\.\d{2} ')
     totals_pattern = re.compile(r'^(\d{1,3}(?:,\d{3})*\.\d{2}-?)(?: (\d{1,3}(?:,\d{3})*\.\d{2}-?)){3}$')
+    reserved = ('Deposits And Other Additions', 'Checks and Substitute Checks', 'Gap in check sequence', 'Daily Balance Detail')
     
     tail, head = itertools.tee(data)
     next(head)
-    
     for line, next_line in zip(tail, head):
         if not total_deductions and totals_pattern.match(line):
             totals = []
@@ -57,14 +67,14 @@ def parse_transaction_text(data: list):
                 totals.append(float(total))
             total_deposits = totals[1]
             total_deductions = totals[2]
-        elif re.search('Deposits and Other Additions There were', line):
+        
+        elif re.search('Deposits and Other Additions', line):
             trans_type = TransactionType.DEPOSIT
         elif re.search('Checks and Substitute Checks', line):
             trans_type = TransactionType.CHECK
         elif re.search('Gap in check sequence', line):
             trans_type = TransactionType.DEDUCTION
-        elif re.search('Daily Balance Detail', line):
-            # Done 
+        elif re.search('Daily Balance Detail', line):  # Done
             break
         
         # Processing the transaction
@@ -75,17 +85,23 @@ def parse_transaction_text(data: list):
                 amount = round(float(tokens[i+1].replace(',', '')), 2)
                 date = tokens[i+2]
                 reference = tokens[i+3]
-                transactions.append(BankTransaction(date, trans_type, amount, f'Check number: {check_num} [ref:{reference}]'))
+                description = f'Check number: {check_num} [ref:{reference}]'
+                transactions.append(Transaction(date, trans_type, amount, description))
         elif trans_type in (TransactionType.DEDUCTION, TransactionType.DEPOSIT) and trans_pattern.match(line):
             tokens = line.split()
             date = tokens[0]
             amount = round(float(tokens[1].replace(',', '')), 2)
             description = ' '.join(tokens[2:])
             if not trans_pattern.match(next_line):
-                description += ' ' + next_line
-            transactions.append(BankTransaction(date, trans_type, amount, description))
+                found = False
+                for r in reserved:
+                    if re.search(r, next_line):
+                        found = True
+                if not found:
+                    description += ' ' + next_line
+            transactions.append(Transaction(date, trans_type, amount, description))
     
-    # Parsing and validation
+    # Amount validation
     sum_of_deductions = round(sum([float(t.amount) for t in transactions if t.type in (TransactionType.CHECK, TransactionType.DEDUCTION)]), 2)
     sum_of_deposits = round(sum([float(t.amount) for t in transactions if t.type == TransactionType.DEPOSIT]), 2)
     if sum_of_deductions != total_deductions:   
