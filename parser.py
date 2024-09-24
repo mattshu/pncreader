@@ -1,10 +1,18 @@
 import itertools
+import logging
 import os
 import re
 from enum import Enum, auto
 from pypdf import PdfReader
-from typing import List
+from typing import List, Tuple
 
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()],
+)
+
+log = logging.getLogger(__name__)
 
 class TransactionType(Enum):
     DEDUCTION = auto()
@@ -32,7 +40,7 @@ class Transaction:
     def __hash__(self):
         return hash((self.date, self.type, self.amount, self.description))
 
-class BankStatement:
+class Statement:
     def __init__(self, entries: List[Transaction], date: str):
         self.entries = entries
         self.date = date
@@ -43,6 +51,7 @@ class BankStatement:
 
 def parse_transaction_text(data: list):
     if not data:
+        log.warning('No data provided to parse!')
         return []
     
     transactions: List[Transaction] = []
@@ -53,11 +62,22 @@ def parse_transaction_text(data: list):
     check_pattern = re.compile(r'\d+ \d+\.\d{2} \d{2}/\d{2}')
     trans_pattern = re.compile(r'^\d{2}/\d{2} (\d{1,3}(,\d{3})*|\d*)\.\d{2} ')
     totals_pattern = re.compile(r'^(\d{1,3}(?:,\d{3})*\.\d{2}-?)(?: (\d{1,3}(?:,\d{3})*\.\d{2}-?)){3}$')
-    reserved = ('Deposits And Other Additions', 'Checks and Substitute Checks', 'Gap in check sequence', 'Daily Balance Detail')
     
-    tail, head = itertools.tee(data)
-    next(head)
-    for line, next_line in zip(tail, head):
+    # When processing transactions, if the next line contains any of these markers,
+    # it's probably not part of the previous transaction description
+    reserved: Tuple[str] = (
+        'Deposits And Other Additions',
+        'Checks and Substitute Checks',
+        'Gap in check sequence',
+        'Daily Balance Detail',
+    )
+    
+    # This is just to easily get the next line while processing; two iters, one ahead by an item
+    head, tail = itertools.tee(data)
+    next(tail)
+    
+    log.info('Begin processing data...')
+    for line, next_line in zip(head, tail):
         if not total_deductions and totals_pattern.match(line):
             totals = []
             for l in line.split():
@@ -68,17 +88,26 @@ def parse_transaction_text(data: list):
             total_deposits = totals[1]
             total_deductions = totals[2]
         
-        elif re.search('Deposits and Other Additions', line):
+        if not total_deductions or not total_deposits:
+            log.warning('Could not parse total deduction amount. Possibly corrupted PDF file!')
+            break
+        
+        if re.search('Deposits and Other Additions', line):
+            log.info('Totals found,')
             trans_type = TransactionType.DEPOSIT
         elif re.search('Checks and Substitute Checks', line):
+            log.info('End deposit section, begin check lookup...')
             trans_type = TransactionType.CHECK
         elif re.search('Gap in check sequence', line):
+            log.info('End check section, begin transaction lookup...')
             trans_type = TransactionType.DEDUCTION
-        elif re.search('Daily Balance Detail', line):  # Done
+        elif re.search('Daily Balance Detail', line):
+            log.info('Processing complete!')
             break
         
         # Processing the transaction
         if trans_type == TransactionType.CHECK and check_pattern.match(line):
+            log.info('Processing checks...')
             tokens = line.split()
             for i in range(0, len(tokens), 4):
                 check_num = tokens[i]
@@ -88,6 +117,7 @@ def parse_transaction_text(data: list):
                 description = f'Check number: {check_num} [ref:{reference}]'
                 transactions.append(Transaction(date, trans_type, amount, description))
         elif trans_type in (TransactionType.DEDUCTION, TransactionType.DEPOSIT) and trans_pattern.match(line):
+            log.info(f'Found transaction ID{len(transactions)}')
             tokens = line.split()
             date = tokens[0]
             amount = round(float(tokens[1].replace(',', '')), 2)
@@ -105,13 +135,13 @@ def parse_transaction_text(data: list):
     sum_of_deductions = round(sum([float(t.amount) for t in transactions if t.type in (TransactionType.CHECK, TransactionType.DEDUCTION)]), 2)
     sum_of_deposits = round(sum([float(t.amount) for t in transactions if t.type == TransactionType.DEPOSIT]), 2)
     if sum_of_deductions != total_deductions:   
-        print(f'\033[93mDEDUCTION ERROR; EXPECTED {total_deductions}, GOT: {sum_of_deductions}\033[0m')
+        log.fatal(f'\033[93mERROR; DEDUCTIONS TOTAL EXPECTED {total_deductions}, GOT: {sum_of_deductions}\033[0m')
     else:
-        print(f'\033[92mDEDUCTIONS MATCH!\033[0m {total_deductions} == {sum_of_deductions}')
+        log.info(f'\033[92mDeduction totals match!\033[0m found in PDF: {total_deductions}, total of found deposits: {sum_of_deductions}')
     if sum_of_deposits != total_deposits:
-        print(f'\033[93mDEPOSIT ERROR; EXPECTED {total_deposits}, GOT: {sum_of_deposits}\033[0m')
+        log.fatal(f'\033[93mERROR; DEPOSIT TOTAL EXPECTED {total_deposits}, GOT: {sum_of_deposits}\033[0m')
     else:
-        print(f'\033[92mDEPOSITS MATCH!\033[0m {total_deposits} == {sum_of_deposits}')
+        log.info(f'\033[92mDeposit totals match!\033[0m found in PDF: {total_deposits}, total of found deposits: {sum_of_deposits}')
     return transactions
 
 def load_text_file_to_list(file_name):
@@ -133,12 +163,19 @@ def extract_text_from_pdf(pdf_path):
             text += page.extract_text()
         return text
     except Exception as e:
-        print(f"Error reading {pdf_path}: {e}")
+        log.exception(f"Error reading {pdf_path}: {e}")
         return None
 
 def _dbg_convert_pdfs_to_text_files():
-    # Get all PDF files in the current directory
-    pdf_files = [f for f in os.listdir() if f.lower().endswith('.pdf')]
+    # Get all PNC Statement PDFs in the current directory
+    
+    statement_pattern = re.compile(r'^Statement_[A-Za-z]{3}_(\d{1,2})_(\d{4})\.pdf$')
+    
+    pdf_files = [f for f in os.listdir() if statement_pattern.match(f)]
+    
+    if not pdf_files:
+        log.fatal('Could not find any PNC Statements. Ensure they are in this format: Statement_Mmm_DD_YYYY.pdf')
+        return
     
     # Process each PDF file
     for pdf_file in pdf_files:
@@ -148,16 +185,6 @@ def _dbg_convert_pdfs_to_text_files():
             txt_file_name = os.path.splitext(pdf_file)[0] + ".txt"
             with open(txt_file_name, 'w', encoding='utf-8') as txt_file:
                 txt_file.write(text)
-            print(f"Extracted text from {pdf_file} to {txt_file_name}")
+            log.info(f"Extracted text from {pdf_file}, exported to {txt_file_name}")
         else:
-            print(f"Failed to extract text from {pdf_file}")
-
-# DEBUG
-jun = load_text_file_to_list('jun.txt')
-jul = load_text_file_to_list('jul.txt')
-aug = load_text_file_to_list('aug.txt')
-pjun = parse_transaction_text(jun)
-pjul = parse_transaction_text(jul)
-paug = parse_transaction_text(aug)
-from pprint import pprint
-pp =  lambda v: pprint(v)
+            log.exception(f"Failed to extract text from {pdf_file}")
