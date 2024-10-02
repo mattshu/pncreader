@@ -1,3 +1,4 @@
+import csv
 import itertools
 import logging
 import os
@@ -68,11 +69,13 @@ def parse_transaction_text(data: list):
     reserved: Tuple[str] = (
         'Deposits And Other Additions',
         'Checks and Substitute Checks',
-        'Gap in check sequence',
+        'Banking/Debit Card Withdrawals and Purchases',
+        'Online and Electronic Banking Deductions',
+        'Other Deductions',
         'Daily Balance Detail',
     )
     
-    # This is just to easily get the next line while processing; two iters, one ahead by an item
+    # This will get the next line while processing; two iters, one ahead by an item
     head, tail = itertools.tee(data)
     next(tail)
     
@@ -88,22 +91,22 @@ def parse_transaction_text(data: list):
             total_deposits = totals[1]
             total_deductions = totals[2]
         
-        if not total_deductions or not total_deposits:
-            log.warning('Could not parse total deduction amount. Possibly corrupted PDF file!')
-            break
         
         if re.search('Deposits and Other Additions', line):
-            log.info('Totals found,')
             trans_type = TransactionType.DEPOSIT
         elif re.search('Checks and Substitute Checks', line):
             log.info('End deposit section, begin check lookup...')
             trans_type = TransactionType.CHECK
-        elif re.search('Gap in check sequence', line):
+        elif re.search('Banking/Debit Card Withdrawals and Purchases There were', line):
             log.info('End check section, begin transaction lookup...')
             trans_type = TransactionType.DEDUCTION
         elif re.search('Daily Balance Detail', line):
             log.info('Processing complete!')
             break
+        
+        # if not total_deductions or not total_deposits:
+        #   log.warning('Could not parse total deduction/deposit amount. Possibly corrupted PDF file!')
+        #   break
         
         # Processing the transaction
         if trans_type == TransactionType.CHECK and check_pattern.match(line):
@@ -117,7 +120,6 @@ def parse_transaction_text(data: list):
                 description = f'Check number: {check_num} [ref:{reference}]'
                 transactions.append(Transaction(date, trans_type, amount, description))
         elif trans_type in (TransactionType.DEDUCTION, TransactionType.DEPOSIT) and trans_pattern.match(line):
-            log.info(f'Found transaction ID{len(transactions)}')
             tokens = line.split()
             date = tokens[0]
             amount = round(float(tokens[1].replace(',', '')), 2)
@@ -132,59 +134,73 @@ def parse_transaction_text(data: list):
             transactions.append(Transaction(date, trans_type, amount, description))
     
     # Amount validation
-    sum_of_deductions = round(sum([float(t.amount) for t in transactions if t.type in (TransactionType.CHECK, TransactionType.DEDUCTION)]), 2)
-    sum_of_deposits = round(sum([float(t.amount) for t in transactions if t.type == TransactionType.DEPOSIT]), 2)
-    if sum_of_deductions != total_deductions:   
-        log.fatal(f'\033[93mERROR; DEDUCTIONS TOTAL EXPECTED {total_deductions}, GOT: {sum_of_deductions}\033[0m')
+    total_deductions = round(sum([float(t.amount) for t in transactions if t.type in (TransactionType.CHECK, TransactionType.DEDUCTION)]), 2)
+    total_deposits = round(sum([float(t.amount) for t in transactions if t.type == TransactionType.DEPOSIT]), 2)
+    if total_deductions != total_deductions:   
+        log.fatal(f'\033[93mERROR; DEDUCTIONS TOTAL EXPECTED {total_deductions}, GOT: {total_deductions}\033[0m')
     else:
-        log.info(f'\033[92mDeduction totals match!\033[0m found in PDF: {total_deductions}, total of found deposits: {sum_of_deductions}')
-    if sum_of_deposits != total_deposits:
-        log.fatal(f'\033[93mERROR; DEPOSIT TOTAL EXPECTED {total_deposits}, GOT: {sum_of_deposits}\033[0m')
+        log.info(f'\033[92mDeduction totals match!\033[0m found in PDF: {total_deductions}, total of found deductions: {total_deductions}')
+    if total_deposits != total_deposits:
+        log.fatal(f'\033[93mERROR; DEPOSIT TOTAL EXPECTED {total_deposits}, GOT: {total_deposits}\033[0m')
     else:
-        log.info(f'\033[92mDeposit totals match!\033[0m found in PDF: {total_deposits}, total of found deposits: {sum_of_deposits}')
+        log.info(f'\033[92mDeposit totals match!\033[0m found in PDF: {total_deposits}, total of found deposits: {total_deposits}')
     return transactions
 
-def load_text_file_to_list(file_name):
-    try:
-        with open(file_name, 'r') as file:
-            content = file.readlines()
-            return [line.strip() for line in content]
-    except FileNotFoundError:
-        print(f"File {file_name} not found.")
-        return []
-
-# Function to extract text from a PDF file
-def extract_text_from_pdf(pdf_path):
+def extract_text_from_pdf(pdf_path: str) -> str:
+    """Extracts text from a PDF file and returns it as a string."""
     try:
         pdf_reader = PdfReader(pdf_path)
         text = ""
-        for page_num in range(len(pdf_reader.pages)):
-            page = pdf_reader.pages[page_num]
+        for page in pdf_reader.pages:
             text += page.extract_text()
         return text
     except Exception as e:
         log.exception(f"Error reading {pdf_path}: {e}")
         return None
 
-def _dbg_convert_pdfs_to_text_files():
-    # Get all PNC Statement PDFs in the current directory
+def parse_pdfs_to_csv(output_csv: str):
+    """Parses text from all matching PDF files in the current directory and writes the results to a CSV."""
     
+    # Regex pattern for matching the PDF file names
     statement_pattern = re.compile(r'^Statement_[A-Za-z]{3}_(\d{1,2})_(\d{4})\.pdf$')
     
+    # Find all matching PDF files in the current directory
     pdf_files = [f for f in os.listdir() if statement_pattern.match(f)]
     
     if not pdf_files:
         log.fatal('Could not find any PNC Statements. Ensure they are in this format: Statement_Mmm_DD_YYYY.pdf')
         return
     
-    # Process each PDF file
-    for pdf_file in pdf_files:
-        text = extract_text_from_pdf(pdf_file)
-        if text:
-            # Create a text file with the same name as the PDF
-            txt_file_name = os.path.splitext(pdf_file)[0] + ".txt"
-            with open(txt_file_name, 'w', encoding='utf-8') as txt_file:
-                txt_file.write(text)
-            log.info(f"Extracted text from {pdf_file}, exported to {txt_file_name}")
-        else:
-            log.exception(f"Failed to extract text from {pdf_file}")
+    # Open the CSV file for writing
+    with open(output_csv, 'w', newline='', encoding='utf-8') as csvfile:
+        fieldnames = ['Date', 'Type', 'Amount', 'Description']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        
+        # Write the header row
+        writer.writeheader()
+        
+        # Process each PDF file
+        for pdf_file in pdf_files:
+            log.info(f"Processing {pdf_file}...")
+            text = extract_text_from_pdf(pdf_file)
+            if text:
+                # Parse the extracted text into transactions
+                transactions = parse_transaction_text(text.splitlines())
+                if not transactions or len(transactions) < 1:
+                    log.warning('No transactions found!!!')
+                    return
+                
+                # Write each transaction to the CSV file
+                for transaction in transactions:
+                    writer.writerow({
+                        'Date': transaction.date,
+                        'Type': transaction.type.name,
+                        'Amount': transaction.amount,
+                        'Description': transaction.description
+                    })
+                log.info(f"Finished processing {pdf_file}.")
+            else:
+                log.exception(f"Failed to extract text from {pdf_file}")
+
+# DEBUG
+parse_pdfs_to_csv('parsed_transactions.csv')
